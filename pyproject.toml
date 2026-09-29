@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "A tiny, educational implementation of Iceberg v2 table concepts"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["pyarrow>=18"]
+dependencies = ["fastavro>=1.9", "pyarrow>=18"]
 
 [tool.uv]
 # Keep the project runnable straight from its directory without installing the package.

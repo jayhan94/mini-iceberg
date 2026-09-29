@@ -1,20 +1,25 @@
 """A deliberately small local table that demonstrates Iceberg v2 concepts.
 
-The metadata relationships follow Iceberg: table metadata -> snapshot -> manifest
-list -> manifests -> immutable Parquet data/delete files. Manifests use readable
-JSON instead of Avro, so this is a teaching model rather than an Iceberg reader.
+The metadata relationships and Avro manifest schemas follow Iceberg v2. The
+implementation is deliberately limited to local, unpartitioned Parquet tables.
 """
 
 from __future__ import annotations
 
 import copy
+import json
+import os
 import secrets
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import unquote, urlsplit
 
-from .storage import read_json, read_parquet, write_json, write_parquet
+from .avro import manifest_list_schema, manifest_schema, read_avro, write_avro
+from .storage import read_json, read_parquet, write_json, write_parquet, write_text
 
+# These numeric values are defined by the Iceberg v2 manifest schema.
 _CONTENT_DATA = 0
 _CONTENT_POSITION_DELETES = 1
 _SUPPORTED_TYPES = {"int", "long", "string", "boolean", "double"}
@@ -39,8 +44,8 @@ class MiniIceberg:
         now = _now_ms()
         metadata = {
             "format-version": 2,
-            "table-uuid": secrets.token_hex(16),
-            "location": str(root),
+            "table-uuid": str(uuid.uuid4()),
+            "location": root.as_uri(),
             "last-updated-ms": now,
             "last-sequence-number": 0,
             "last-column-id": len(fields),
@@ -60,6 +65,7 @@ class MiniIceberg:
         write_json(table.metadata_dir / "v1.metadata.json", metadata)
         # This tiny pointer stands in for a catalog such as Hive or REST.
         write_json(table.metadata_dir / "current", "v1.metadata.json", atomic=True)
+        write_text(table.metadata_dir / "version-hint.text", "1", atomic=True)
         return table
 
     @classmethod
@@ -103,26 +109,62 @@ class MiniIceberg:
         raise KeyError(f"Snapshot {snapshot_id} does not exist")
 
     def _table_path(self, relative_path: str) -> Path:
-        """Resolve a metadata path while keeping it inside this local table."""
-        path = (self.location / relative_path).resolve()
+        """Resolve an Iceberg file URI or table-relative path inside this local table."""
+        parsed = urlsplit(relative_path)
+        if parsed.scheme == "file":
+            path_text = unquote(parsed.path)
+            if os.name == "nt" and path_text.startswith("/") and path_text[2:3] == ":":
+                path_text = path_text[1:]
+            path = Path(path_text).resolve()
+        elif parsed.scheme:
+            raise ValueError(f"Only local file paths are supported: {relative_path}")
+        else:
+            path = (self.location / relative_path).resolve()
         if not path.is_relative_to(self.location):
             raise ValueError(f"Metadata path escapes the table: {relative_path}")
         return path
 
-    def _files(self, snapshot: dict[str, Any] | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    def _file_location(self, relative_path: str) -> str:
+        return self._table_path(relative_path).as_uri()
+
+    def _files(
+        self, snapshot: dict[str, Any] | None
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         if snapshot is None:
             return [], []
-        listing = read_json(self._table_path(snapshot["manifest-list"]))
+        listing = read_avro(self._table_path(snapshot["manifest-list"]))
         data_files: list[dict[str, Any]] = []
         delete_files: list[dict[str, Any]] = []
-        for manifest_info in listing["manifests"]:
-            manifest = read_json(self._table_path(manifest_info["manifest-path"]))
-            for entry in manifest["entries"]:
-                if entry["status"] == "DELETED":
+        for manifest_info in listing:
+            manifest = read_avro(self._table_path(manifest_info["manifest_path"]))
+            for entry in manifest:
+                # Iceberg status 2 means this file was removed from the snapshot.
+                if entry["status"] == 2:
                     continue
+                data_file = entry["data_file"]
                 item = {
-                    **entry["data-file"],
-                    **{key: value for key, value in entry.items() if key != "data-file"},
+                    "content": data_file["content"],
+                    "file-path": data_file["file_path"],
+                    "file-format": data_file["file_format"],
+                    "partition": data_file["partition"],
+                    "record-count": data_file["record_count"],
+                    "file-size-in-bytes": data_file["file_size_in_bytes"],
+                    "status": {0: "EXISTING", 1: "ADDED"}[entry["status"]],
+                    "snapshot-id": (
+                        entry["snapshot_id"]
+                        if entry["snapshot_id"] is not None
+                        else manifest_info["added_snapshot_id"]
+                    ),
+                    "sequence-number": (
+                        entry["sequence_number"]
+                        if entry["sequence_number"] is not None
+                        else manifest_info["sequence_number"]
+                    ),
+                    "file-sequence-number": (
+                        entry["file_sequence_number"]
+                        if entry["file_sequence_number"] is not None
+                        else manifest_info["sequence_number"]
+                    ),
                 }
                 target = data_files if item["content"] == _CONTENT_DATA else delete_files
                 target.append(item)
@@ -173,9 +215,9 @@ class MiniIceberg:
             normalized.append({name: row.get(name) for name in names})
         if not normalized:
             return 0
-        filename = f"data/{secrets.token_hex(8)}.parquet"
-        count = write_parquet(self._table_path(filename), normalized, fields)
-        new_file = self._file_entry(filename, _CONTENT_DATA, count)
+        file_path = self._file_location(f"data/{secrets.token_hex(8)}.parquet")
+        count = write_parquet(self._table_path(file_path), normalized, fields)
+        new_file = self._file_entry(file_path, _CONTENT_DATA, count)
         self._commit([new_file], [], operation="append", added_rows=count)
         return count
 
@@ -196,24 +238,24 @@ class MiniIceberg:
         )
         if not positions:
             return 0
-        filename = f"deletes/{secrets.token_hex(8)}.parquet"
+        file_path = self._file_location(f"deletes/{secrets.token_hex(8)}.parquet")
         delete_fields = [
             {"id": 2147483546, "name": "file_path", "type": "string", "required": True},
             {"id": 2147483545, "name": "pos", "type": "long", "required": True},
         ]
-        count = write_parquet(self._table_path(filename), positions, delete_fields)
-        new_delete = self._file_entry(filename, _CONTENT_POSITION_DELETES, count)
+        count = write_parquet(self._table_path(file_path), positions, delete_fields)
+        new_delete = self._file_entry(file_path, _CONTENT_POSITION_DELETES, count)
         self._commit([], [new_delete], operation="delete", deleted_rows=count)
         return count
 
-    @staticmethod
-    def _file_entry(path: str, content: int, record_count: int) -> dict[str, Any]:
+    def _file_entry(self, path: str, content: int, record_count: int) -> dict[str, Any]:
         return {
             "content": content,
             "file-path": path,
             "file-format": "PARQUET",
             "partition": {},
             "record-count": record_count,
+            "file-size-in-bytes": self._table_path(path).stat().st_size,
         }
 
     def _commit(
@@ -238,11 +280,24 @@ class MiniIceberg:
             self._as_added(item, snapshot_id, sequence) for item in new_deletes
         ]
         manifest_infos = []
+        # Data and position-delete files live in separate manifests.
         for content, entries in ((_CONTENT_DATA, data), (_CONTENT_POSITION_DELETES, deletes)):
             if entries:
-                manifest_infos.append(self._write_manifest(snapshot_id, sequence, content, entries))
-        list_path = f"metadata/manifest-list-{snapshot_id}.json"
-        write_json(self._table_path(list_path), {"snapshot-id": snapshot_id, "manifests": manifest_infos})
+                manifest_infos.append(
+                    self._write_manifest(metadata, snapshot_id, sequence, content, entries)
+                )
+        list_path = self._file_location(f"metadata/snap-{snapshot_id}-{sequence}.avro")
+        write_avro(
+            self._table_path(list_path),
+            manifest_list_schema(),
+            manifest_infos,
+            {
+                "snapshot-id": str(snapshot_id),
+                "parent-snapshot-id": str(parent["snapshot-id"] if parent else "null"),
+                "sequence-number": str(sequence),
+                "format-version": "2",
+            },
+        )
         timestamp = _now_ms()
         snapshot = {
             "snapshot-id": snapshot_id,
@@ -267,6 +322,7 @@ class MiniIceberg:
         next_name = f"v{version}.metadata.json"
         write_json(self.metadata_dir / next_name, metadata)
         write_json(self.metadata_dir / "current", next_name, atomic=True)
+        write_text(self.metadata_dir / "version-hint.text", str(version), atomic=True)
 
     @staticmethod
     def _as_existing(entry: dict[str, Any]) -> dict[str, Any]:
@@ -291,33 +347,80 @@ class MiniIceberg:
             "data-file": file,
         }
 
+    @staticmethod
+    def _avro_entry(entry: dict[str, Any]) -> dict[str, Any]:
+        file = entry["data-file"]
+        return {
+            "status": {"EXISTING": 0, "ADDED": 1, "DELETED": 2}[entry["status"]],
+            "snapshot_id": entry["snapshot-id"],
+            "sequence_number": entry["sequence-number"],
+            "file_sequence_number": entry["file-sequence-number"],
+            "data_file": {
+                "content": file["content"],
+                "file_path": file["file-path"],
+                "file_format": file["file-format"],
+                "partition": {},
+                "record_count": file["record-count"],
+                "file_size_in_bytes": file["file-size-in-bytes"],
+                "column_sizes": None,
+                "value_counts": None,
+                "null_value_counts": None,
+                "nan_value_counts": None,
+                "lower_bounds": None,
+                "upper_bounds": None,
+                "key_metadata": None,
+                "split_offsets": None,
+                "equality_ids": None,
+                "sort_order_id": None,
+            },
+        }
+
     def _write_manifest(
-        self, snapshot_id: int, sequence: int, content: int, entries: list[dict[str, Any]]
+        self,
+        metadata: dict[str, Any],
+        snapshot_id: int,
+        sequence: int,
+        content: int,
+        entries: list[dict[str, Any]],
     ) -> dict[str, Any]:
         kind = "data" if content == _CONTENT_DATA else "deletes"
-        filename = f"metadata/manifest-{snapshot_id}-{kind}.json"
-        write_json(self._table_path(filename), {
-            "format-version": 2,
-            "schema-id": 0,
-            "partition-spec-id": 0,
-            "content": kind,
-            "entries": entries,
-        })
+        manifest_path = self._file_location(f"metadata/{snapshot_id}-{kind}.avro")
+        schema = next(
+            item for item in metadata["schemas"]
+            if item["schema-id"] == metadata["current-schema-id"]
+        )
+        write_avro(
+            self._table_path(manifest_path),
+            manifest_schema(),
+            [self._avro_entry(entry) for entry in entries],
+            {
+                "schema": json.dumps(schema, separators=(",", ":")),
+                "schema-id": str(metadata["current-schema-id"]),
+                "partition-spec": "[]",
+                "partition-spec-id": "0",
+                "format-version": "2",
+                "content": kind,
+            },
+        )
+        # Counts in the manifest list let readers skip manifests without reading them.
         added = [entry for entry in entries if entry["status"] == "ADDED"]
         existing = [entry for entry in entries if entry["status"] == "EXISTING"]
         return {
-            "manifest-path": filename,
-            "partition-spec-id": 0,
+            "manifest_path": manifest_path,
+            "manifest_length": self._table_path(manifest_path).stat().st_size,
+            "partition_spec_id": 0,
             "content": content,
-            "sequence-number": sequence,
-            "min-sequence-number": min(entry["sequence-number"] for entry in entries),
-            "added-snapshot-id": snapshot_id,
-            "added-files-count": len(added),
-            "existing-files-count": len(existing),
-            "deleted-files-count": 0,
-            "added-rows-count": sum(entry["data-file"]["record-count"] for entry in added),
-            "existing-rows-count": sum(entry["data-file"]["record-count"] for entry in existing),
-            "deleted-rows-count": 0,
+            "sequence_number": sequence,
+            "min_sequence_number": min(entry["sequence-number"] for entry in entries),
+            "added_snapshot_id": snapshot_id,
+            "added_files_count": len(added),
+            "existing_files_count": len(existing),
+            "deleted_files_count": 0,
+            "partitions": [],
+            "added_rows_count": sum(entry["data-file"]["record-count"] for entry in added),
+            "existing_rows_count": sum(entry["data-file"]["record-count"] for entry in existing),
+            "deleted_rows_count": 0,
+            "key_metadata": None,
         }
 
     def snapshots(self) -> list[dict[str, Any]]:

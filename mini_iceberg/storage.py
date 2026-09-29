@@ -40,6 +40,21 @@ def read_json(path: Path) -> Any:
         return json.load(stream)
 
 
+def write_text(path: Path, value: str, *, atomic: bool = False) -> None:
+    """Write plain text; unlike JSON, a version hint must not add a newline."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    target = path
+    if atomic:
+        target = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        target.write_text(value, encoding="utf-8", newline="")
+        if atomic:
+            os.replace(target, path)
+    finally:
+        if atomic and target.exists():
+            target.unlink()
+
+
 def write_parquet(
     path: Path, rows: Iterable[dict[str, Any]], fields: list[dict[str, Any]]
 ) -> int:
