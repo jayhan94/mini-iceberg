@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlsplit
 
-from .avro import manifest_list_schema, manifest_schema, read_avro, write_avro
+from .manifests import manifest_list_schema, manifest_schema, read_avro, write_avro
 from .storage import read_json, read_parquet, write_json, write_parquet, write_text
 
 # These numeric values are defined by the Iceberg v2 manifest schema.

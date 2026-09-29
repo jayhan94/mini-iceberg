@@ -63,7 +63,7 @@ demo_table/
 
 读表时，程序从 metadata 定位当前 snapshot，再沿 `snapshot → manifest list → manifest → Parquet 文件` 找数据。追加不会改写旧 Parquet 文件，而是写入新文件并发布一个新快照。删除也不改写数据文件：位置删除记录行所在文件和行号，扫描时再应用删除。旧 snapshot 仍引用原来的文件集合，因此可以按 snapshot id 回看旧状态。
 
-manifest Avro schema、manifest list Avro schema 和 OCF metadata 位于 [`mini_iceberg/avro.py`](mini_iceberg/avro.py)；提交和扫描流程从 [`mini_iceberg/table.py`](mini_iceberg/table.py) 开始。提交会先写不可变的数据和 metadata 文件，最后原子更新本地 catalog 指针与 DuckDB 的版本提示。
+manifest Avro schema、manifest list Avro schema 和 OCF metadata 位于 [`mini_iceberg/manifests.py`](mini_iceberg/manifests.py)；提交和扫描流程从 [`mini_iceberg/table.py`](mini_iceberg/table.py) 开始。提交会先写不可变的数据和 metadata 文件，最后原子更新本地 catalog 指针与 DuckDB 的版本提示。
 
 ## 实现范围
 
