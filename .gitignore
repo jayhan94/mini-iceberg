@@ -206,6 +206,10 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Local caches and scratch tables created by interoperability tests.
+.duckdb-extensions/
+.test-tmp/
+
 # PyPI configuration file
 .pypirc
 

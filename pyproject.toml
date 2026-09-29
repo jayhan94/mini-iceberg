@@ -6,6 +6,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["fastavro>=1.9", "pyarrow>=18"]
 
+[dependency-groups]
+test = ["duckdb>=1.4", "pytest>=8"]
+
 [tool.uv]
 # Keep the project runnable straight from its directory without installing the package.
 package = false

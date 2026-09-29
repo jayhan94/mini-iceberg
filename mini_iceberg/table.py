@@ -1,23 +1,29 @@
-"""A deliberately small local table that demonstrates Iceberg v2 concepts.
+"""A deliberately small local/S3 table that demonstrates Iceberg v2 concepts.
 
 The metadata relationships and Avro manifest schemas follow Iceberg v2. The
-implementation is deliberately limited to local, unpartitioned Parquet tables.
+implementation is deliberately limited to unpartitioned Parquet tables.
 """
 
 from __future__ import annotations
 
 import copy
 import json
-import os
 import secrets
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import unquote, urlsplit
 
 from .manifests import manifest_list_schema, manifest_schema, read_avro, write_avro
-from .storage import read_json, read_parquet, write_json, write_parquet, write_text
+from .storage import (
+    TableStorage,
+    read_json,
+    read_parquet,
+    read_text,
+    write_json,
+    write_parquet,
+    write_text,
+)
 
 # These numeric values are defined by the Iceberg v2 manifest schema.
 _CONTENT_DATA = 0
@@ -26,26 +32,29 @@ _SUPPORTED_TYPES = {"int", "long", "string", "boolean", "double"}
 
 
 class MiniIceberg:
-    """Manage one unpartitioned, local table using a tiny subset of Iceberg v2."""
+    """Manage one unpartitioned local or S3 table using a tiny Iceberg v2 subset."""
 
-    def __init__(self, location: Path):
-        self.location = location.resolve()
-        self.metadata_dir = self.location / "metadata"
+    def __init__(self, location: str | Path):
+        self.storage = TableStorage(location)
+        self.location = self.storage.location
 
     @classmethod
-    def create(cls, location: str | Path, schema: dict[str, str]) -> "MiniIceberg":
+    def create(
+        cls,
+        location: str | Path,
+        schema: dict[str, str],
+    ) -> "MiniIceberg":
         """Create an empty table. Schema is a mapping from column name to simple type."""
-        root = Path(location).resolve()
-        if root.exists() and any(root.iterdir()):
-            raise FileExistsError(f"Table location is not empty: {root}")
+        table = cls(location)
+        if not table.storage.is_empty():
+            raise FileExistsError(f"Table location is not empty: {table.location}")
         fields = cls._make_fields(schema)
-        root.mkdir(parents=True, exist_ok=True)
-        table = cls(root)
+        table.storage.create_dir()
         now = _now_ms()
         metadata = {
             "format-version": 2,
             "table-uuid": str(uuid.uuid4()),
-            "location": root.as_uri(),
+            "location": table.location,
             "last-updated-ms": now,
             "last-sequence-number": 0,
             "last-column-id": len(fields),
@@ -61,17 +70,20 @@ class MiniIceberg:
             "sort-orders": [{"order-id": 0, "fields": []}],
             "default-sort-order-id": 0,
         }
-        table.metadata_dir.mkdir(parents=True, exist_ok=True)
-        write_json(table.metadata_dir / "v1.metadata.json", metadata)
-        # This tiny pointer stands in for a catalog such as Hive or REST.
-        write_json(table.metadata_dir / "current", "v1.metadata.json", atomic=True)
-        write_text(table.metadata_dir / "version-hint.text", "1", atomic=True)
+        write_json(table.storage, "metadata/v1.metadata.json", metadata)
+        # DuckDB and this mini implementation use the same simple version pointer.
+        write_text(table.storage, "metadata/version-hint.text", "1", atomic=True)
         return table
 
     @classmethod
-    def open(cls, location: str | Path) -> "MiniIceberg":
-        table = cls(Path(location))
-        if not (table.metadata_dir / "current").exists():
+    def open(
+        cls,
+        location: str | Path,
+    ) -> "MiniIceberg":
+        table = cls(location)
+        if not table.storage.exists("metadata/version-hint.text") and not table.storage.exists(
+            "metadata/current"
+        ):
             raise FileNotFoundError(f"No mini-iceberg table at {table.location}")
         table._metadata()
         return table
@@ -88,8 +100,16 @@ class MiniIceberg:
         return fields
 
     def _metadata(self) -> dict[str, Any]:
-        filename = read_json(self.metadata_dir / "current")
-        return read_json(self.metadata_dir / filename)
+        hint = "metadata/version-hint.text"
+        if self.storage.exists(hint):
+            version = read_text(self.storage, hint).strip()
+            if not version.isdecimal():
+                raise ValueError(f"Invalid Iceberg version hint: {version!r}")
+            filename = f"v{version}.metadata.json"
+        else:
+            # Read tables created by the previous mini-iceberg version.
+            filename = read_json(self.storage, "metadata/current")
+        return read_json(self.storage, f"metadata/{filename}")
 
     def _schema(self, metadata: dict[str, Any]) -> list[dict[str, Any]]:
         schema_id = metadata["current-schema-id"]
@@ -108,35 +128,19 @@ class MiniIceberg:
                 return snapshot
         raise KeyError(f"Snapshot {snapshot_id} does not exist")
 
-    def _table_path(self, relative_path: str) -> Path:
-        """Resolve an Iceberg file URI or table-relative path inside this local table."""
-        parsed = urlsplit(relative_path)
-        if parsed.scheme == "file":
-            path_text = unquote(parsed.path)
-            if os.name == "nt" and path_text.startswith("/") and path_text[2:3] == ":":
-                path_text = path_text[1:]
-            path = Path(path_text).resolve()
-        elif parsed.scheme:
-            raise ValueError(f"Only local file paths are supported: {relative_path}")
-        else:
-            path = (self.location / relative_path).resolve()
-        if not path.is_relative_to(self.location):
-            raise ValueError(f"Metadata path escapes the table: {relative_path}")
-        return path
-
     def _file_location(self, relative_path: str) -> str:
-        return self._table_path(relative_path).as_uri()
+        return self.storage.uri(relative_path)
 
     def _files(
         self, snapshot: dict[str, Any] | None
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         if snapshot is None:
             return [], []
-        listing = read_avro(self._table_path(snapshot["manifest-list"]))
+        listing = read_avro(self.storage, snapshot["manifest-list"])
         data_files: list[dict[str, Any]] = []
         delete_files: list[dict[str, Any]] = []
         for manifest_info in listing:
-            manifest = read_avro(self._table_path(manifest_info["manifest_path"]))
+            manifest = read_avro(self.storage, manifest_info["manifest_path"])
             for entry in manifest:
                 # Iceberg status 2 means this file was removed from the snapshot.
                 if entry["status"] == 2:
@@ -176,7 +180,7 @@ class MiniIceberg:
         data_files, delete_files = self._files(snapshot)
         deletes_by_file: dict[str, set[int]] = {}
         for delete in delete_files:
-            for position_delete in read_parquet(self._table_path(delete["file-path"])):
+            for position_delete in read_parquet(self.storage, delete["file-path"]):
                 source = position_delete["file_path"]
                 data_sequence = self._entry_sequence(data_files, source)
                 # In v2, a delete file only applies to data files no newer than itself.
@@ -185,7 +189,7 @@ class MiniIceberg:
         for data_file in data_files:
             path = data_file["file-path"]
             hidden_positions = deletes_by_file.get(path, set())
-            for position, row in enumerate(read_parquet(self._table_path(path))):
+            for position, row in enumerate(read_parquet(self.storage, path)):
                 if position not in hidden_positions:
                     yield row, path, position
 
@@ -216,7 +220,7 @@ class MiniIceberg:
         if not normalized:
             return 0
         file_path = self._file_location(f"data/{secrets.token_hex(8)}.parquet")
-        count = write_parquet(self._table_path(file_path), normalized, fields)
+        count = write_parquet(self.storage, file_path, normalized, fields)
         new_file = self._file_entry(file_path, _CONTENT_DATA, count)
         self._commit([new_file], [], operation="append", added_rows=count)
         return count
@@ -243,7 +247,7 @@ class MiniIceberg:
             {"id": 2147483546, "name": "file_path", "type": "string", "required": True},
             {"id": 2147483545, "name": "pos", "type": "long", "required": True},
         ]
-        count = write_parquet(self._table_path(file_path), positions, delete_fields)
+        count = write_parquet(self.storage, file_path, positions, delete_fields)
         new_delete = self._file_entry(file_path, _CONTENT_POSITION_DELETES, count)
         self._commit([], [new_delete], operation="delete", deleted_rows=count)
         return count
@@ -255,7 +259,7 @@ class MiniIceberg:
             "file-format": "PARQUET",
             "partition": {},
             "record-count": record_count,
-            "file-size-in-bytes": self._table_path(path).stat().st_size,
+            "file-size-in-bytes": self.storage.file_size(path),
         }
 
     def _commit(
@@ -288,7 +292,8 @@ class MiniIceberg:
                 )
         list_path = self._file_location(f"metadata/snap-{snapshot_id}-{sequence}.avro")
         write_avro(
-            self._table_path(list_path),
+            self.storage,
+            list_path,
             manifest_list_schema(),
             manifest_infos,
             {
@@ -317,12 +322,15 @@ class MiniIceberg:
         metadata["current-snapshot-id"] = snapshot_id
         metadata["last-sequence-number"] = sequence
         metadata["last-updated-ms"] = timestamp
-        current_name = read_json(self.metadata_dir / "current")
-        version = int(current_name[1:].split(".", 1)[0]) + 1
+        hint = "metadata/version-hint.text"
+        if self.storage.exists(hint):
+            version = int(read_text(self.storage, hint).strip()) + 1
+        else:
+            current_name = read_json(self.storage, "metadata/current")
+            version = int(current_name[1:].split(".", 1)[0]) + 1
         next_name = f"v{version}.metadata.json"
-        write_json(self.metadata_dir / next_name, metadata)
-        write_json(self.metadata_dir / "current", next_name, atomic=True)
-        write_text(self.metadata_dir / "version-hint.text", str(version), atomic=True)
+        write_json(self.storage, f"metadata/{next_name}", metadata)
+        write_text(self.storage, hint, str(version), atomic=True)
 
     @staticmethod
     def _as_existing(entry: dict[str, Any]) -> dict[str, Any]:
@@ -390,7 +398,8 @@ class MiniIceberg:
             if item["schema-id"] == metadata["current-schema-id"]
         )
         write_avro(
-            self._table_path(manifest_path),
+            self.storage,
+            manifest_path,
             manifest_schema(),
             [self._avro_entry(entry) for entry in entries],
             {
@@ -407,7 +416,7 @@ class MiniIceberg:
         existing = [entry for entry in entries if entry["status"] == "EXISTING"]
         return {
             "manifest_path": manifest_path,
-            "manifest_length": self._table_path(manifest_path).stat().st_size,
+            "manifest_length": self.storage.file_size(manifest_path),
             "partition_spec_id": 0,
             "content": content,
             "sequence_number": sequence,

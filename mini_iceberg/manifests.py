@@ -7,12 +7,11 @@ the schemas visible makes the metadata files easier to compare with the spec.
 from __future__ import annotations
 
 import copy
-import os
-import uuid
-from pathlib import Path
 from typing import Any, Iterable
 
 from fastavro import reader, writer
+
+from .storage import TableStorage
 
 
 def _optional_map(
@@ -217,32 +216,26 @@ def manifest_list_schema() -> dict[str, Any]:
 
 
 def write_avro(
-    path: Path,
+    storage: TableStorage,
+    path: str,
     schema: dict[str, Any],
     records: Iterable[dict[str, Any]],
     metadata: dict[str, str],
 ) -> None:
-    """Write an Avro object container file, replacing the final path only when complete."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("wb") as stream:
-            # OCF stores both Avro records and key/value metadata in one file.
-            writer(
-                stream,
-                copy.deepcopy(schema),
-                records,
-                codec="null",
-                metadata=metadata,
-                strict=True,
-            )
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    """Write an Avro OCF through the selected local or object-store filesystem."""
+    with storage.open_output_stream(path) as stream:
+        # OCF stores both Avro records and key/value metadata in one file.
+        writer(
+            stream,
+            copy.deepcopy(schema),
+            records,
+            codec="null",
+            metadata=metadata,
+            strict=True,
+        )
 
 
-def read_avro(path: Path) -> list[dict[str, Any]]:
+def read_avro(storage: TableStorage, path: str) -> list[dict[str, Any]]:
     """Read records from an Avro object container file."""
-    with path.open("rb") as stream:
+    with storage.open_input_file(path) as stream:
         return list(reader(stream))
