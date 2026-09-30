@@ -12,7 +12,7 @@ import secrets
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -206,7 +206,7 @@ class MiniIceberg:
             else:
                 yield table, path, positions
 
-    def scan_arrow(self, snapshot_id: int | None = None) -> pa.Table:
+    def scan(self, snapshot_id: int | None = None) -> pa.Table:
         """Return visible rows as an Arrow table, preserving column types."""
         metadata = self._metadata()
         fields = self._schema(metadata)
@@ -216,15 +216,11 @@ class MiniIceberg:
             return pa.Table.from_batches([], schema=iceberg_arrow_schema(fields))
         return pa.concat_tables(tables, promote_options="default")
 
-    def scan(self, snapshot_id: int | None = None) -> list[dict[str, Any]]:
-        """Read visible rows as ordinary Python dictionaries."""
-        return self.scan_arrow(snapshot_id).to_pylist()
-
     def append(
         self,
-        rows: Iterable[Mapping[str, Any]] | pa.Table | pa.RecordBatch | pa.RecordBatchReader,
+        rows: pa.Table | pa.RecordBatch | pa.RecordBatchReader,
     ) -> int:
-        """Append Python row mappings or Arrow data, then publish a snapshot."""
+        """Append Arrow data as an immutable Parquet file and publish a snapshot."""
         metadata = self._metadata()
         fields = self._schema(metadata)
         table = _as_arrow_table(rows, fields)
@@ -454,23 +450,17 @@ def _now_ms() -> int:
 
 
 def _as_arrow_table(
-    data: Iterable[Mapping[str, Any]] | pa.Table | pa.RecordBatch | pa.RecordBatchReader,
+    data: pa.Table | pa.RecordBatch | pa.RecordBatchReader,
     fields: list[dict[str, Any]],
 ) -> pa.Table:
-    """Normalize supported public inputs to the table's internal Arrow schema."""
+    """Normalize Arrow input to the table's Iceberg schema."""
     schema = iceberg_arrow_schema(fields)
     if isinstance(data, pa.RecordBatchReader):
         data = data.read_all()
     elif isinstance(data, pa.RecordBatch):
         data = pa.Table.from_batches([data])
     if not isinstance(data, pa.Table):
-        rows = list(data)
-        names = {field["name"] for field in fields}
-        for row in rows:
-            unknown = row.keys() - names
-            if unknown:
-                raise ValueError(f"Unknown columns: {sorted(unknown)}")
-        return pa.Table.from_pylist(rows, schema=schema)
+        raise TypeError("append() accepts only PyArrow Table, RecordBatch, or RecordBatchReader")
 
     names = set(data.column_names)
     expected = [field["name"] for field in fields]

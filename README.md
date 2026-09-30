@@ -19,25 +19,27 @@ uv run python -m mini_iceberg show .\demo_table
 也可以从 Python 调用。普通路径和 `file://` URL 都支持：
 
 ```python
+import pyarrow as pa
+
 from mini_iceberg import MiniIceberg
 
 table = MiniIceberg.create("demo_table", {"id": "long", "name": "string"})
-table.append([{"id": 1, "name": "Ada"}, {"id": 2, "name": "Lin"}])
+table.append(pa.table({"id": [1, 2], "name": ["Ada", "Lin"]}))
 before_delete = table.snapshots()[-1]["snapshot-id"]
 table.delete_where("id", 2)
 
-print(table.scan())                       # 当前快照：只剩 Ada
-print(table.scan(before_delete))          # 时间旅行：两行都还在
+print(table.scan().to_pylist())                       # 当前快照：只剩 Ada
+print(table.scan(before_delete).to_pylist())          # 时间旅行：两行都还在
 ```
 
-`append()` 也接受 PyArrow `Table`、`RecordBatch` 和 `RecordBatchReader`。内部统一转成 Arrow table，再写入 Parquet；`scan()` 默认返回 Python 字典列表，`scan_arrow()` 返回保留列类型的 PyArrow `Table`：
+表数据 API 只接受和返回 Arrow。`append()` 支持 PyArrow `Table`、`RecordBatch` 和 `RecordBatchReader`；`scan()` 返回保留列类型的 PyArrow `Table`。需要普通 Python 值时，可以在应用边界调用 Arrow 的 `.to_pylist()`：
 
 ```python
 import pyarrow as pa
 
 table.append(pa.table({"id": [3], "name": ["Grace"]}))
-arrow_rows = table.scan_arrow()
-python_rows = table.scan()
+arrow_rows = table.scan()
+python_rows = arrow_rows.to_pylist()
 ```
 
 ## 使用 S3
@@ -45,16 +47,18 @@ python_rows = table.scan()
 先创建 S3 bucket，再把 `s3://bucket/prefix` 作为表位置。PyArrow 会按 AWS 默认凭据链读取环境变量、AWS 配置文件或运行环境的角色凭据：
 
 ```python
+import pyarrow as pa
+
 table = MiniIceberg.create(
     "s3://my-bucket/warehouse/demo",
     {"id": "long", "name": "string"},
 )
-table.append([{"id": 1, "name": "Ada"}])
+table.append(pa.table({"id": [1], "name": ["Ada"]}))
 
 table = MiniIceberg.open(
     "s3://my-bucket/warehouse/demo",
 )
-print(table.scan())
+print(table.scan().to_pylist())
 ```
 
 S3 bucket 需要预先存在。请把凭据放在环境变量、凭据文件或密钥管理服务中。PyArrow 支持的 S3 region、endpoint 等连接设置可以放在 S3 URL 查询参数里；URL 交给 `FileSystem.from_uri()` 解析。

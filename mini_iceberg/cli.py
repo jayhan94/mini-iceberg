@@ -3,23 +3,34 @@
 import argparse
 import json
 
+import pyarrow as pa
+
 from .table import MiniIceberg
 
 
 def _demo(location: str) -> None:
     table = MiniIceberg.create(location, {"id": "long", "name": "string"})
-    table.append([{"id": 1, "name": "Ada"}, {"id": 2, "name": "Lin"}])
+    table.append(pa.table({"id": [1, 2], "name": ["Ada", "Lin"]}))
     before_delete = table.snapshots()[-1]["snapshot-id"]
     table.delete_where("id", 2)
     print(f"Table files: {table.location}")
-    print("Current rows:", json.dumps(table.scan(), ensure_ascii=False))
-    print("Rows at the earlier snapshot:", json.dumps(table.scan(before_delete), ensure_ascii=False))
+    print("Current rows:", json.dumps(table.scan().to_pylist(), ensure_ascii=False))
+    print(
+        "Rows at the earlier snapshot:",
+        json.dumps(table.scan(before_delete).to_pylist(), ensure_ascii=False),
+    )
     print("Snapshots:", json.dumps(table.snapshots(), ensure_ascii=False, indent=2))
 
 
 def _show(location: str) -> None:
     table = MiniIceberg.open(location)
-    print(json.dumps({"rows": table.scan(), "snapshots": table.snapshots()}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {"rows": table.scan().to_pylist(), "snapshots": table.snapshots()},
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def main() -> None:
