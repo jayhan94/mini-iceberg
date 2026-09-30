@@ -1,4 +1,9 @@
-"""A small, URL-selected filesystem shared by all Iceberg file formats."""
+"""统一访问本地/S3 文件，并在 Iceberg 元数据、Arrow 与文件格式之间搭桥。
+
+Arrow 是进程内的列式数据；Parquet 是持久化行数据的列式文件格式。
+Avro 保存文件清单，JSON 保存表定义，它们服务于元数据管理，不替代 Parquet。
+上层代码只操作 TableStorage，因此读写算法不需要分别实现本地和 S3 分支。
+"""
 
 from __future__ import annotations
 
@@ -24,11 +29,11 @@ _ARROW_TYPES = {
 
 
 class TableStorage:
-    """A table-root view over the filesystem chosen by its location URI.
+    """把表目录视为统一文件系统的根目录。
 
-    ``FileSystem.from_uri`` creates the concrete filesystem (local, S3, etc.).
-    A SubTreeFileSystem then makes all table paths relative to this table, so
-    Parquet, Avro, and JSON code can use the same small filesystem interface.
+    FileSystem.from_uri 负责解析位置并选择本地/S3 实例；SubTreeFileSystem
+    使 metadata/v1.metadata.json 这样的相对路径自动落到指定表目录下。
+    这是路径视图，不是操作系统级的安全沙箱。
     """
 
     def __init__(self, location: str | Path):
@@ -51,8 +56,8 @@ class TableStorage:
         self.fs = pafs.SubTreeFileSystem(root_path, base_fs)
         self.root_path = root_path
 
-        # For local paths, publish a stable absolute URI in Iceberg metadata.
-        # For remote filesystems, preserve the URI accepted by PyArrow.
+        # 清单中的文件位置需要完整 URI，便于 DuckDB 等其他引擎定位文件。
+        # 实际读写则使用相对于表根目录的路径；这里同时维护两种表示。
         self.location = (
             Path(root_path).resolve().as_uri()
             if isinstance(base_fs, pafs.LocalFileSystem)
@@ -68,7 +73,7 @@ class TableStorage:
         return requested.rstrip("/")
 
     def resolve(self, location: str | Path) -> str:
-        """Normalize a path inside the table without interpreting a URL."""
+        """将本表的完整文件 URI 转成内部相对路径；本例仅访问表目录内的文件。"""
         raw = os.fspath(location).replace("\\", "/")
         root_uri = self.location.rstrip("/")
         if raw.startswith(root_uri + "/"):
@@ -79,7 +84,7 @@ class TableStorage:
         return path
 
     def uri(self, location: str | Path) -> str:
-        """Return an absolute URI, suitable for Iceberg metadata and manifests."""
+        """生成写入 Iceberg metadata/manifest 的完整文件 URI。"""
         return f"{self.location.rstrip('/')}/{self.resolve(location)}"
 
     def create_dir(self, location: str | Path = "") -> None:
@@ -120,20 +125,22 @@ class TableStorage:
             try:
                 with self.open_output_stream(temporary) as stream:
                     stream.write(value)
-                # Local rename publishes the new version hint in one step.
+                # 先写临时文件再替换入口，避免读者读到只写了一半的版本号。
+                # 这是单个文件的发布步骤，没有执行 catalog 的比较并交换（CAS）。
                 self.fs.move(temporary, path)
             finally:
                 if self.exists(temporary):
                     self.fs.delete_file(temporary)
             return
 
-        # Object stores publish the complete object when the stream closes.
+        # S3 单对象写入完成后才可见；atomic 参数在这里不增加锁或冲突检测。
+        # “读到完整对象”与“多个写者不会互相覆盖提交”是不同的保证。
         with self.open_output_stream(path) as stream:
             stream.write(value)
 
 
 def write_json(storage: TableStorage, path: str, value: Any, *, atomic: bool = False) -> None:
-    """Write readable table metadata JSON."""
+    """JSON 用于表定义和 snapshot 引用；行数据仍只写入 Parquet。"""
     data = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
     storage.write_bytes(path, data, atomic=atomic)
 
@@ -152,12 +159,12 @@ def read_text(storage: TableStorage, path: str) -> str:
 
 
 def iceberg_arrow_schema(fields: list[dict[str, Any]]) -> pa.Schema:
-    """Build Arrow schema while retaining Iceberg's stable field IDs."""
+    """把 Iceberg 的列类型、是否必填和字段 ID 映射到 Arrow schema。"""
     return pa.schema([_arrow_field(field) for field in fields])
 
 
 def write_parquet(storage: TableStorage, path: str, table: pa.Table) -> int:
-    """Write an Arrow table as Parquet using the table's selected filesystem."""
+    """Arrow → Parquet：持久化列数据，并返回 manifest 需要的物理记录数。"""
     with storage.open_output_stream(path) as stream:
         pq.write_table(table, stream)
     return table.num_rows
@@ -166,7 +173,8 @@ def write_parquet(storage: TableStorage, path: str, table: pa.Table) -> int:
 def _arrow_field(field: dict[str, Any]) -> pa.Field:
     metadata = None
     if "id" in field:
-        # Parquet field IDs preserve Iceberg's stable column identity.
+        # PyArrow 会把这个元数据键写成 Parquet 字段 ID，使文件列与 Iceberg 列对应。
+        # 重命名不应改变列 ID；因此仅保存列名不足以支持真实的 schema 演进。
         metadata = {b"PARQUET:field_id": str(field["id"]).encode()}
     return pa.field(
         field["name"],
@@ -177,5 +185,5 @@ def _arrow_field(field: dict[str, Any]) -> pa.Field:
 
 
 def read_parquet(storage: TableStorage, path: str) -> pa.Table:
-    """Read one Parquet file as Arrow using the table's selected filesystem."""
+    """Parquet → Arrow：仅解码文件；所属 snapshot 和删除规则由 table.py 处理。"""
     return pq.read_table(storage.resolve(path), filesystem=storage.fs)
