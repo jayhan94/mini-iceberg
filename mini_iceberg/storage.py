@@ -7,7 +7,7 @@ import os
 import posixpath
 import uuid
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 from urllib.parse import quote
 
 import pyarrow as pa
@@ -151,15 +151,13 @@ def read_text(storage: TableStorage, path: str) -> str:
     return storage.read_bytes(path).decode("utf-8")
 
 
-def write_parquet(
-    storage: TableStorage,
-    path: str,
-    rows: Iterable[dict[str, Any]],
-    fields: list[dict[str, Any]],
-) -> int:
-    """Write records as Parquet using the table's selected filesystem."""
-    schema = pa.schema([_arrow_field(field) for field in fields])
-    table = pa.Table.from_pylist(list(rows), schema=schema)
+def iceberg_arrow_schema(fields: list[dict[str, Any]]) -> pa.Schema:
+    """Build Arrow schema while retaining Iceberg's stable field IDs."""
+    return pa.schema([_arrow_field(field) for field in fields])
+
+
+def write_parquet(storage: TableStorage, path: str, table: pa.Table) -> int:
+    """Write an Arrow table as Parquet using the table's selected filesystem."""
     with storage.open_output_stream(path) as stream:
         pq.write_table(table, stream)
     return table.num_rows
@@ -178,6 +176,6 @@ def _arrow_field(field: dict[str, Any]) -> pa.Field:
     )
 
 
-def read_parquet(storage: TableStorage, path: str) -> list[dict[str, Any]]:
-    """Read rows from one Parquet file using the table's selected filesystem."""
-    return pq.read_table(storage.resolve(path), filesystem=storage.fs).to_pylist()
+def read_parquet(storage: TableStorage, path: str) -> pa.Table:
+    """Read one Parquet file as Arrow using the table's selected filesystem."""
+    return pq.read_table(storage.resolve(path), filesystem=storage.fs)

@@ -30,6 +30,16 @@ print(table.scan())                       # 当前快照：只剩 Ada
 print(table.scan(before_delete))          # 时间旅行：两行都还在
 ```
 
+`append()` 也接受 PyArrow `Table`、`RecordBatch` 和 `RecordBatchReader`。内部统一转成 Arrow table，再写入 Parquet；`scan()` 默认返回 Python 字典列表，`scan_arrow()` 返回保留列类型的 PyArrow `Table`：
+
+```python
+import pyarrow as pa
+
+table.append(pa.table({"id": [3], "name": ["Grace"]}))
+arrow_rows = table.scan_arrow()
+python_rows = table.scan()
+```
+
 ## 使用 S3
 
 先创建 S3 bucket，再把 `s3://bucket/prefix` 作为表位置。PyArrow 会按 AWS 默认凭据链读取环境变量、AWS 配置文件或运行环境的角色凭据：

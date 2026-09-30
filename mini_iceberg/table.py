@@ -12,11 +12,15 @@ import secrets
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
+
+import pyarrow as pa
+import pyarrow.compute as pc
 
 from .manifests import manifest_list_schema, manifest_schema, read_avro, write_avro
 from .storage import (
     TableStorage,
+    iceberg_arrow_schema,
     read_json,
     read_parquet,
     read_text,
@@ -174,53 +178,60 @@ class MiniIceberg:
                 target.append(item)
         return data_files, delete_files
 
-    def _iter_rows(
+    def _visible_file_tables(
         self, snapshot: dict[str, Any] | None
-    ) -> Iterable[tuple[dict[str, Any], str, int]]:
+    ) -> Iterable[tuple[pa.Table, str, pa.Array]]:
+        """Yield visible Arrow rows and their original positions for each file."""
         data_files, delete_files = self._files(snapshot)
         deletes_by_file: dict[str, set[int]] = {}
+        data_sequences = {item["file-path"]: item["sequence-number"] for item in data_files}
         for delete in delete_files:
-            for position_delete in read_parquet(self.storage, delete["file-path"]):
-                source = position_delete["file_path"]
-                data_sequence = self._entry_sequence(data_files, source)
+            position_deletes = read_parquet(self.storage, delete["file-path"])
+            for source, position in zip(
+                position_deletes["file_path"].to_pylist(),
+                position_deletes["pos"].to_pylist(),
+            ):
+                data_sequence = data_sequences.get(source)
                 # In v2, a delete file only applies to data files no newer than itself.
                 if data_sequence is not None and delete["sequence-number"] >= data_sequence:
-                    deletes_by_file.setdefault(source, set()).add(position_delete["pos"])
+                    deletes_by_file.setdefault(source, set()).add(position)
         for data_file in data_files:
             path = data_file["file-path"]
-            hidden_positions = deletes_by_file.get(path, set())
-            for position, row in enumerate(read_parquet(self.storage, path)):
-                if position not in hidden_positions:
-                    yield row, path, position
+            table = read_parquet(self.storage, path)
+            positions = pa.array(range(table.num_rows), type=pa.int64())
+            hidden = deletes_by_file.get(path, set())
+            if hidden:
+                keep = pc.invert(pc.is_in(positions, value_set=pa.array(sorted(hidden))))
+                yield pc.filter(table, keep), path, pc.filter(positions, keep)
+            else:
+                yield table, path, positions
 
-    @staticmethod
-    def _entry_sequence(data_files: list[dict[str, Any]], path: str) -> int | None:
-        for data_file in data_files:
-            if data_file["file-path"] == path:
-                return data_file["sequence-number"]
-        return None
-
-    def scan(self, snapshot_id: int | None = None) -> list[dict[str, Any]]:
-        """Read visible rows now, or from an older snapshot for time travel."""
-        metadata = self._metadata()
-        snapshot = self._snapshot(metadata, snapshot_id)
-        return [row for row, _, _ in self._iter_rows(snapshot)]
-
-    def append(self, rows: Iterable[dict[str, Any]]) -> int:
-        """Write immutable Parquet data files and publish a new snapshot."""
+    def scan_arrow(self, snapshot_id: int | None = None) -> pa.Table:
+        """Return visible rows as an Arrow table, preserving column types."""
         metadata = self._metadata()
         fields = self._schema(metadata)
-        names = [field["name"] for field in fields]
-        normalized = []
-        for row in rows:
-            unknown = row.keys() - set(names)
-            if unknown:
-                raise ValueError(f"Unknown columns: {sorted(unknown)}")
-            normalized.append({name: row.get(name) for name in names})
-        if not normalized:
+        snapshot = self._snapshot(metadata, snapshot_id)
+        tables = [table for table, _, _ in self._visible_file_tables(snapshot)]
+        if not tables:
+            return pa.Table.from_batches([], schema=iceberg_arrow_schema(fields))
+        return pa.concat_tables(tables, promote_options="default")
+
+    def scan(self, snapshot_id: int | None = None) -> list[dict[str, Any]]:
+        """Read visible rows as ordinary Python dictionaries."""
+        return self.scan_arrow(snapshot_id).to_pylist()
+
+    def append(
+        self,
+        rows: Iterable[Mapping[str, Any]] | pa.Table | pa.RecordBatch | pa.RecordBatchReader,
+    ) -> int:
+        """Append Python row mappings or Arrow data, then publish a snapshot."""
+        metadata = self._metadata()
+        fields = self._schema(metadata)
+        table = _as_arrow_table(rows, fields)
+        if not table.num_rows:
             return 0
         file_path = self._file_location(f"data/{secrets.token_hex(8)}.parquet")
-        count = write_parquet(self.storage, file_path, normalized, fields)
+        count = write_parquet(self.storage, file_path, table)
         new_file = self._file_entry(file_path, _CONTENT_DATA, count)
         self._commit([new_file], [], operation="append", added_rows=count)
         return count
@@ -232,14 +243,12 @@ class MiniIceberg:
         if field not in known_fields:
             raise KeyError(f"Unknown column: {field}")
         snapshot = self._snapshot(metadata, None)
-        positions = sorted(
-            (
-                {"file_path": path, "pos": pos}
-                for row, path, pos in self._iter_rows(snapshot)
-                if row.get(field) == value
-            ),
-            key=lambda item: (item["file_path"], item["pos"]),
-        )
+        positions = []
+        for visible, path, source_positions in self._visible_file_tables(snapshot):
+            matches = pc.fill_null(pc.equal(visible[field], pa.scalar(value)), False)
+            matched_positions = pc.filter(source_positions, matches).to_pylist()
+            positions.extend({"file_path": path, "pos": pos} for pos in matched_positions)
+        positions.sort(key=lambda item: (item["file_path"], item["pos"]))
         if not positions:
             return 0
         file_path = self._file_location(f"deletes/{secrets.token_hex(8)}.parquet")
@@ -247,7 +256,10 @@ class MiniIceberg:
             {"id": 2147483546, "name": "file_path", "type": "string", "required": True},
             {"id": 2147483545, "name": "pos", "type": "long", "required": True},
         ]
-        count = write_parquet(self.storage, file_path, positions, delete_fields)
+        delete_table = pa.Table.from_pylist(
+            positions, schema=iceberg_arrow_schema(delete_fields)
+        )
+        count = write_parquet(self.storage, file_path, delete_table)
         new_delete = self._file_entry(file_path, _CONTENT_POSITION_DELETES, count)
         self._commit([], [new_delete], operation="delete", deleted_rows=count)
         return count
@@ -439,3 +451,37 @@ class MiniIceberg:
 
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
+
+
+def _as_arrow_table(
+    data: Iterable[Mapping[str, Any]] | pa.Table | pa.RecordBatch | pa.RecordBatchReader,
+    fields: list[dict[str, Any]],
+) -> pa.Table:
+    """Normalize supported public inputs to the table's internal Arrow schema."""
+    schema = iceberg_arrow_schema(fields)
+    if isinstance(data, pa.RecordBatchReader):
+        data = data.read_all()
+    elif isinstance(data, pa.RecordBatch):
+        data = pa.Table.from_batches([data])
+    if not isinstance(data, pa.Table):
+        rows = list(data)
+        names = {field["name"] for field in fields}
+        for row in rows:
+            unknown = row.keys() - names
+            if unknown:
+                raise ValueError(f"Unknown columns: {sorted(unknown)}")
+        return pa.Table.from_pylist(rows, schema=schema)
+
+    names = set(data.column_names)
+    expected = [field["name"] for field in fields]
+    unknown = names - set(expected)
+    if unknown:
+        raise ValueError(f"Unknown columns: {sorted(unknown)}")
+    arrays = []
+    for field in schema:
+        if field.name not in names:
+            arrays.append(pa.nulls(data.num_rows, type=field.type))
+            continue
+        column = data[field.name]
+        arrays.append(column.cast(field.type, safe=True))
+    return pa.Table.from_arrays(arrays, schema=schema)

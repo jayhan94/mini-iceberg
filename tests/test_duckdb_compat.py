@@ -53,6 +53,25 @@ def test_filesystem_is_selected_from_location_url(workspace_path):
         TableStorage("unknown://bucket/table")
 
 
+def test_python_and_arrow_data_apis_share_an_arrow_model(workspace_path):
+    # Python row mappings and Arrow batches should append to one table, while
+    # scan() returns Python rows and scan_arrow() returns typed Arrow columns.
+    table = MiniIceberg.create(
+        workspace_path / "arrow-api-table", {"id": "long", "name": "string"}
+    )
+    table.append([{"id": 1, "name": "Ada"}])
+    table.append(pa.table({"name": ["Lin"], "id": pa.array([2], type=pa.int64())}))
+
+    assert table.scan() == [
+        {"id": 1, "name": "Ada"},
+        {"id": 2, "name": "Lin"},
+    ]
+    arrow_rows = table.scan_arrow()
+    assert isinstance(arrow_rows, pa.Table)
+    assert arrow_rows.schema.field("id").type == pa.int64()
+    assert arrow_rows.to_pylist() == table.scan()
+
+
 def test_duckdb_reads_current_and_historical_snapshots(workspace_path):
     table_path = workspace_path / "duckdb-table"
     table = MiniIceberg.create(table_path, {"id": "long", "name": "string"})
